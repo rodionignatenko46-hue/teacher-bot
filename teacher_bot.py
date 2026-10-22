@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 import sqlite3
 from flask import Flask, request
 import os
+import threading
 
 # ==========================================
 # ВСТАВЬ СЮДА ТОКЕН НОВОГО БОТА ДЛЯ УЧИТЕЛЕЙ
@@ -29,14 +30,42 @@ def set_teacher_name(user_id, name):
     conn.commit()
 
 # --- РАБОТА С API КОЛЛЕДЖА ---
-def get_schedule(target, date_from, date_to, param="teacher"):
+def get_groups():
     try:
-        url = f"{API_BASE}/schedule_range?{param}={requests.utils.quote(target)}&from={date_from}&to={date_to}"
-        r = requests.get(url)
-        if r.status_code != 200: return None
-        return r.json()
+        r = requests.get(f"{API_BASE}/groups")
+        return r.json() if r.status_code == 200 else []
     except:
-        return None
+        return []
+
+# Универсальная функция поиска (скачиваем расписание всех групп и ищем)
+def search_everywhere(query, date_from, date_to, search_type="teacher"):
+    groups = get_groups()
+    if not groups: return None
+    
+    results = []
+    
+    # Ограничим количество групп для скорости (можно увеличить)
+    # В реальности лучше запрашивать все, но API может не выдержать
+    for group in groups:
+        try:
+            url = f"{API_BASE}/schedule_range?group={requests.utils.quote(group)}&from={date_from}&to={date_to}"
+            r = requests.get(url)
+            if r.status_code == 200:
+                data = r.json()
+                for day in data:
+                    for lesson in day.get('lessons', []):
+                        # Ищем по преподавателю
+                        if search_type == "teacher":
+                            if query.lower() in lesson.get('Teacher', '').lower():
+                                results.append((day['date'], lesson))
+                        # Ищем по кабинету
+                        elif search_type == "room":
+                            if query == str(lesson.get('LectureHall', '')):
+                                results.append((day['date'], lesson))
+        except:
+            continue
+            
+    return results
 
 # --- КЛАВИАТУРЫ ---
 def get_main_menu():
@@ -63,58 +92,56 @@ def change_name(message):
 
 @bot.message_handler(func=lambda message: get_teacher_name(message.chat.id) is None or message.text == '⚙️ Сменить фамилию')
 def save_name(message):
-    # Сохраняем фамилию, если это первый запуск или смена фамилии
     if message.text not in ['📅 Моё расписание на сегодня', '📅 Моё расписание на неделю', '🚪 Проверить кабинет', '🔍 Найти препода']:
         teacher_name = message.text.strip()
         set_teacher_name(message.chat.id, teacher_name)
         bot.send_message(message.chat.id, f"✅ Отлично, {teacher_name}! Теперь выберите действие:", reply_markup=get_main_menu())
 
-# --- МОЁ РАСПИСАНИЕ ---
+# --- МОЁ РАСПИСАНИЕ (Ищем по всем группам, так как API не умеет по фамилии) ---
 @bot.message_handler(func=lambda message: message.text == '📅 Моё расписание на сегодня')
 def today_schedule(message):
     teacher_name = get_teacher_name(message.chat.id)
-    today = datetime.now().strftime('%Y-%m-%d')
-    data = get_schedule(teacher_name, today, today)
+    bot.send_message(message.chat.id, "⏳ Ищу ваши пары на сегодня (проверяю все группы)...")
     
-    if not data:
+    today = datetime.now().strftime('%Y-%m-%d')
+    results = search_everywhere(teacher_name, today, today, search_type="teacher")
+    
+    if not results:
         bot.send_message(message.chat.id, "На сегодня пар нет или произошла ошибка.")
         return
         
     text = f"📚 Ваше расписание на сегодня:\n\n"
-    for day in data:
-        if not day.get('lessons'):
-            text += "Занятий нет.\n"
-            continue
-        for lesson in day['lessons']:
-            text += f"🔹 Пара {lesson.get('NumberLesson')}: {lesson.get('Discipline')}\n"
-            text += f"   👥 Группа: {lesson.get('Group')}\n"
-            text += f"   🚪 Ауд. {lesson.get('LectureHall')} (📍 {lesson.get('Territory', '')})\n\n"
+    for date, lesson in results:
+        text += f"🔹 Пара {lesson.get('NumberLesson')}: {lesson.get('Discipline')}\n"
+        text += f"   👥 Группа: {lesson.get('Group')}\n"
+        text += f"   🚪 Ауд. {lesson.get('LectureHall')} (📍 {lesson.get('Territory', '')})\n\n"
             
     bot.send_message(message.chat.id, text)
 
 @bot.message_handler(func=lambda message: message.text == '📅 Моё расписание на неделю')
 def week_schedule(message):
     teacher_name = get_teacher_name(message.chat.id)
+    bot.send_message(message.chat.id, "⏳ Ищу ваши пары на неделю (это может занять 10-15 секунд)...")
+    
     today = datetime.now()
     end_week = today + timedelta(days=6)
-    data = get_schedule(teacher_name, today.strftime('%Y-%m-%d'), end_week.strftime('%Y-%m-%d'))
     
-    if not data:
+    results = search_everywhere(teacher_name, today.strftime('%Y-%m-%d'), end_week.strftime('%Y-%m-%d'), search_type="teacher")
+    
+    if not results:
         bot.send_message(message.chat.id, "На эту неделю пар нет.")
         return
         
     text = f"📚 Ваше расписание на неделю:\n\n"
-    for day in data:
-        date_obj = datetime.strptime(day['date'], '%Y-%m-%d')
-        text += f"📅 {date_obj.strftime('%d.%m.%Y')}\n"
-        if not day.get('lessons'):
-            text += "Занятий нет.\n\n"
-            continue
-        for lesson in day['lessons']:
-            text += f"🔹 {lesson.get('NumberLesson')} пара: {lesson.get('Discipline')} (Ауд. {lesson.get('LectureHall')})\n"
-        text += "\n"
+    current_date = ""
+    for date, lesson in results:
+        if date != current_date:
+            date_obj = datetime.strptime(date, '%Y-%m-%d')
+            text += f"\n📅 {date_obj.strftime('%d.%m.%Y')}\n"
+            current_date = date
+            
+        text += f"🔹 {lesson.get('NumberLesson')} пара: {lesson.get('Discipline')} (Гр. {lesson.get('Group')}, Ауд. {lesson.get('LectureHall')})\n"
         
-    # Если текст слишком длинный, разбиваем его
     if len(text) > 4000:
         for x in range(0, len(text), 4000):
             bot.send_message(message.chat.id, text[x:x+4000])
@@ -126,70 +153,51 @@ def week_schedule(message):
 def check_room_prompt(message):
     bot.send_message(message.chat.id, "Введите номер кабинета (например: 15, 19, 2):", reply_markup=telebot.types.ReplyKeyboardRemove())
 
-@bot.message_handler(func=lambda message: True and get_teacher_name(message.chat.id) is not None)
-def handle_room_or_teacher(message):
-    text = message.text.strip()
-    
-    # Если это команда меню, игнорируем
-    if text in ['📅 Моё расписание на сегодня', '📅 Моё расписание на неделю', '🔍 Найти препода']:
-        return
+# --- ПОИСК ПРЕПОДА ---
+@bot.message_handler(func=lambda message: message.text == '🔍 Найти препода')
+def find_teacher_prompt(message):
+    bot.send_message(message.chat.id, "Введите фамилию препода:", reply_markup=telebot.types.ReplyKeyboardRemove())
 
+# --- ОБЩИЙ ОБРАБОТЧИК ВВОДА (Кабинет или Поиск) ---
+@bot.message_handler(func=lambda message: True and get_teacher_name(message.chat.id) is not None)
+def handle_search(message):
+    text = message.text.strip()
     today = datetime.now().strftime('%Y-%m-%d')
-    
-    # Логика поиска кабинета (ищем по всем группам, так как API не дает общего списка)
-    # Для простоты мы попробуем найти пары для всех групп из базы (или хотя бы для 36-тп, если API не позволяет все)
-    # В реальности нужно запрашивать расписание всех групп, но чтобы не нагружать API, сделаем проверку по введенному номеру.
-    
-    # ПРОВЕРКА КАБИНЕТА (упрощенная)
+
+    if text in ['📅 Моё расписание на сегодня', '📅 Моё расписание на неделю']:
+        return # Игнорируем, чтобы не ломать меню
+
+    # ПРОВЕРКА КАБИНЕТА (если ввели цифры)
     if text.isdigit() or text.lower().startswith('каб'):
         room_num = text.replace('каб', '').replace(' ', '')
-        bot.send_message(message.chat.id, f"⏳ Ищу, кто занял кабинет {room_num} на сегодня...")
+        bot.send_message(message.chat.id, f"⏳ Ищу пары в кабинете {room_num} на сегодня...")
         
-        # Примечание: API не отдает расписание по кабинету. 
-        # Мы можем запросить расписание для группы, но нам нужен общий срез. 
-        # Временно сделаем заглушку с проверкой по одной известной группе (например, 36-тп)
-        # В будущем это можно улучшить.
-        data = get_schedule("36-тп", today, today, param="group")
+        results = search_everywhere(room_num, today, today, search_type="room")
         
-        found = False
         text_res = f"🚪 Кабинет {room_num}:\n\n"
-        if data:
-            for day in data:
-                for lesson in day.get('lessons', []):
-                    if str(lesson.get('LectureHall')) == room_num:
-                        text_res += f"🔹 Пара {lesson.get('NumberLesson')}: {lesson.get('Discipline')}\n"
-                        text_res += f"   👨‍🏫 {lesson.get('Teacher')} | 👥 {lesson.get('Group')}\n\n"
-                        found = True
-        
-        if not found:
-            text_res += "Свободен (или данные не найдены)."
+        if results:
+            for date, lesson in results:
+                text_res += f"🔹 Пара {lesson.get('NumberLesson')}: {lesson.get('Discipline')}\n"
+                text_res += f"   👨‍🏫 {lesson.get('Teacher')} | 👥 {lesson.get('Group')}\n\n"
+        else:
+            text_res += "Свободен (или данных нет)."
             
         bot.send_message(message.chat.id, text_res, reply_markup=get_main_menu())
         
-    # ПОИСК ПРЕПОДА
-    elif text == '🔍 Найти препода':
-        bot.send_message(message.chat.id, "Введите фамилию препода, чтобы узнать, где он сейчас:", reply_markup=telebot.types.ReplyKeyboardRemove())
-    
-    # ЕСЛИ ВВЕЛИ ФАМИЛИЮ ДЛЯ ПОИСКА
+    # ПОИСК ПРЕПОДА (если ввели фамилию)
     else:
         bot.send_message(message.chat.id, f"⏳ Ищу {text} на сегодня...")
-        data = get_schedule(text, today, today)
+        results = search_everywhere(text, today, today, search_type="teacher")
         
-        if not data:
-            bot.send_message(message.chat.id, "Не удалось найти расписание для этого препода.", reply_markup=get_main_menu())
+        if not results:
+            bot.send_message(message.chat.id, "Не удалось найти пары для этого препода.", reply_markup=get_main_menu())
             return
             
         text_res = f"🕵️‍♂️ Где сейчас {text}:\n\n"
-        has_lessons = False
-        for day in data:
-            for lesson in day.get('lessons', []):
-                text_res += f"🔹 Пара {lesson.get('NumberLesson')}: {lesson.get('Discipline')}\n"
-                text_res += f"   🚪 Ауд. {lesson.get('LectureHall')} (📍 {lesson.get('Territory', '')})\n"
-                text_res += f"   👥 Группа: {lesson.get('Group')}\n\n"
-                has_lessons = True
-                
-        if not has_lessons:
-            text_res += "Сегодня пар нет."
+        for date, lesson in results:
+            text_res += f"🔹 Пара {lesson.get('NumberLesson')}: {lesson.get('Discipline')}\n"
+            text_res += f"   🚪 Ауд. {lesson.get('LectureHall')} (📍 {lesson.get('Territory', '')})\n"
+            text_res += f"   👥 Группа: {lesson.get('Group')}\n\n"
             
         bot.send_message(message.chat.id, text_res, reply_markup=get_main_menu())
 
@@ -213,8 +221,8 @@ def getMessage():
 
 @app.route('/set_webhook')
 def set_webhook():
-    # ТУТ ССЫЛКА НА ТВОЙ НОВЫЙ RENDER СЕРВИС!
-    url = "https://teacher-bot-glh2.onrender.com/" + TOKEN
+    # ССЫЛКА НА ТВОЙ СЕРВИС НА RENDER!
+    url = "/" + TOKEN
     s = bot.set_webhook(url)
     return "Webhook setup ok" if s else "Webhook setup failed"
 
