@@ -222,7 +222,7 @@ def getMessage():
 @app.route('/set_webhook')
 def set_webhook():
     # ССЫЛКА НА ТВОЙ СЕРВИС НА RENDER!
-    url = "/" + TOKEN
+    url = "https://teacher-bot-glh2.onrender.com/" + TOKEN
     s = bot.set_webhook(url)
     return "Webhook setup ok" if s else "Webhook setup failed"
 
